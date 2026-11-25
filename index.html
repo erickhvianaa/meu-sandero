@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Meu Sandero">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<title>Meu Sandero</title>
+<style>
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;background:#0d0f12;color:#eef1f4;font:16px -apple-system,system-ui,sans-serif;padding:calc(env(safe-area-inset-top) + 12px) 14px calc(env(safe-area-inset-bottom) + 84px)}
+h1{font-size:24px;margin:4px 0 14px}h2{font-size:17px;margin:20px 0 8px}
+.card{background:#191d23;border-radius:14px;padding:14px;margin-bottom:10px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.grid .card{margin:0}
+.big{font-size:26px;font-weight:700}.sub{color:#929aa5;font-size:13px}
+.alert{border:1px solid #e0a030}
+label{display:block;font-size:13px;color:#929aa5;margin:10px 0 4px}
+input,select{width:100%;min-width:0;padding:12px;border-radius:10px;border:1px solid #333a44;background:#11141a;color:#eef1f4;font-size:16px}
+input[type=checkbox]{width:auto;margin-right:8px}
+button{width:100%;padding:13px;margin-top:12px;border:0;border-radius:10px;background:#e5252a;color:#fff;font-size:16px;font-weight:600}
+button.link{width:auto;background:none;color:#ff7377;padding:4px 0;margin:6px 0 0;font-size:14px}
+nav{position:fixed;left:0;right:0;bottom:0;display:flex;background:#14171c;padding-bottom:env(safe-area-inset-bottom)}
+nav button{background:none;color:#929aa5;margin:0;border-radius:0}nav button.on{color:#ff5458}
+#msg{color:#ffb4b6;min-height:1em}
+</style>
+</head>
+<body>
+<h1>Meu Sandero</h1>
+<div id="msg" role="alert"></div>
+<main id="tela"></main>
+<nav id="nav" hidden></nav>
+<script>
+'use strict';
+const $=s=>document.querySelector(s);
+const ler=k=>{try{return JSON.parse(localStorage.getItem(k))}catch(e){return null}};
+const gravar=(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}};
+let cfg=ler('cfg'),sessao=ler('sessao'),aba='painel';
+let D={status:null,ajuste:null,abast:[],manut:[]};
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>'&#'+c.charCodeAt(0)+';');
+const n=(v,d=0)=>v==null?'--':Number(v).toLocaleString('pt-BR',{minimumFractionDigits:d,maximumFractionDigits:d});
+const reais=v=>Number(v||0).toLocaleString('pt-BR',{style:'currency',currency:'BRL'});
+const dia=s=>s?s.split('-').reverse().join('/'):'';
+const hoje=()=>{const d=new Date();return new Date(d-d.getTimezoneOffset()*6e4).toISOString().slice(0,10)};
+const num=v=>v===''?null:Number(String(v).replace(',','.'));
+
+async function auth(tipo,corpo){
+  const r=await fetch(cfg.url+'/auth/v1/token?grant_type='+tipo,{method:'POST',headers:{apikey:cfg.key,'Content-Type':'application/json'},body:JSON.stringify(corpo)});
+  const j=await r.json();
+  if(!r.ok){const e=new Error(j.error_description||j.msg||'Falha no login');e.status=r.status;throw e}
+  sessao={token:j.access_token,refresh:j.refresh_token,expira:Date.now()+j.expires_in*1000};
+  gravar('sessao',sessao);
+}
+async function api(caminho,metodo='GET',corpo,prefer){
+  if(Date.now()>sessao.expira-60000){
+    try{await auth('refresh_token',{refresh_token:sessao.refresh})}
+    catch(e){if(e.status===400||e.status===401)sair();throw e}
+  }
+  const h={apikey:cfg.key,Authorization:'Bearer '+sessao.token,'Content-Type':'application/json'};
+  if(prefer)h.Prefer=prefer;
+  const r=await fetch(cfg.url+'/rest/v1/'+caminho,{method:metodo,headers:h,body:corpo&&JSON.stringify(corpo)});
+  const t=await r.text();
+  if(!r.ok)throw new Error('Erro do banco ('+r.status+'): '+t.slice(0,150));
+  return t?JSON.parse(t):null;
+}
+async function carregar(){
+  const [s,a,ab,m]=await Promise.all([api('status_carro?select=*'),api('ajustes?select=*'),
+    api('abastecimentos?select=*&order=km.desc'),api('manutencoes?select=*&order=data.desc,km.desc')]);
+  D={status:s[0]||null,ajuste:a[0]||null,abast:ab,manut:m};
+}
+
+// Hodômetro estimado: o maior entre os registros e (km informado + distância medida pela launcher)
+function kmAtual(){
+  const v=[...D.abast,...D.manut].map(x=>Number(x.km));
+  const a=D.ajuste,s=D.status;
+  if(a){
+    let k=Number(a.km_base);
+    if(s&&s.km_acumulado!=null&&a.km_acumulado_base!=null)k+=Math.max(0,s.km_acumulado-a.km_acumulado_base);
+    v.push(k);
+  }
+  return v.length?Math.max(...v):null;
+}
+// km/l entre tanques cheios, somando os abastecimentos parciais do intervalo
+function consumos(){
+  const l=[...D.abast].sort((a,b)=>a.km-b.km),r={};
+  let ini=null,litros=0;
+  for(const x of l){
+    if(ini!=null)litros+=Number(x.litros);
+    if(x.tanque_cheio){
+      if(ini!=null&&x.km>ini&&litros>0)r[x.id]=(x.km-ini)/litros;
+      ini=Number(x.km);litros=0;
+    }
+  }
+  return r;
+}
+// Só o registro mais recente de cada serviço gera aviso
+function pendentes(){
+  const visto=new Set(),km=kmAtual(),r=[];
+  for(const m of D.manut){
+    const k=m.servico.trim().toLowerCase();
+    if(visto.has(k))continue;
+    visto.add(k);
+    const fk=m.proximo_km!=null&&km!=null?m.proximo_km-km:null;
+    const fd=m.proxima_data?Math.round((Date.parse(m.proxima_data)-Date.parse(hoje()))/864e5):null;
+    if(fk==null&&fd==null)continue;
+    r.push({m,fk,fd,urgente:(fk!=null&&fk<=500)||(fd!=null&&fd<=15)});
+  }
+  return r.sort((a,b)=>b.urgente-a.urgente);
+}
+
+const campo=(nome,rotulo,tipo='text',extra='')=>`<label for="${nome}">${rotulo}</label><input id="${nome}" name="${nome}" type="${tipo}" ${tipo==='text'&&extra.includes('decimal')?'pattern="[0-9]+([.,][0-9]+)?"':''} ${extra}>`;
+const dec='inputmode="decimal"';
+const int='inputmode="numeric" pattern="[0-9]+" title="Só números, sem ponto"';
+
+const telas={
+ painel(){
+  const s=D.status,c=Object.values(consumos()),mes=hoje().slice(0,7);
+  const gasto=[...D.abast,...D.manut].filter(x=>x.data.startsWith(mes)).reduce((t,x)=>t+Number(x.valor||0),0);
+  const bloco=(r,v)=>`<div class="card"><div class="sub">${r}</div><div class="big">${v}</div></div>`;
+  return `<div class="grid">${bloco('KM estimado',n(kmAtual()))}${bloco('Combustível',s?.combustivel_pct!=null?s.combustivel_pct+'%':'--')}
+  ${bloco('Média (tanque cheio)',c.length?n(c.reduce((a,b)=>a+b,0)/c.length,1)+' km/l':'--')}${bloco('Gasto no mês',reais(gasto))}
+  ${bloco('Motor',s?.temperatura_c!=null?s.temperatura_c+' °C':'--')}${bloco('Bateria',s?.tensao_v!=null?n(s.tensao_v,1)+' V':'--')}</div>
+  <p class="sub">${s?'Última leitura do carro: '+new Date(s.atualizado_em).toLocaleString('pt-BR'):'Ainda sem leituras da launcher.'}</p>
+  <button data-acao="atualizar">Atualizar</button>
+  <h2>Próximas manutenções</h2>${pendentes().map(p=>`<div class="card ${p.urgente?'alert':''}"><b>${esc(p.m.servico)}</b><div class="sub">${[p.fk!=null?(p.fk<0?'passou '+n(-p.fk)+' km':'faltam '+n(p.fk)+' km'):'',p.fd!=null?(p.fd<0?'venceu em ':'até ')+dia(p.m.proxima_data):''].filter(Boolean).join(' · ')}</div></div>`).join('')||'<p class="sub">Nenhuma programada.</p>'}
+  <h2>Corrigir hodômetro</h2><form class="card" data-form="ajuste">${campo('km_base','KM que aparece no painel do carro','text',int+' required')}<button>Salvar</button></form>
+  <button class="link" data-acao="sair">Sair da conta</button>`;
+ },
+ abast(){
+  const c=consumos();
+  return `<form class="card" data-form="abast">${campo('data','Data','date',`value="${hoje()}" required`)}${campo('km','KM no painel','text',int+' required')}
+  ${campo('litros','Litros','text',dec+' required')}${campo('valor','Valor total (R$)','text',dec+' required')}
+  <label for="combustivel">Combustível</label><select id="combustivel" name="combustivel"><option>Gasolina</option><option>Etanol</option></select>
+  <label><input type="checkbox" name="tanque_cheio" checked>Enchi o tanque</label><button>Salvar abastecimento</button></form>
+  <h2>Histórico</h2>${D.abast.map(x=>`<div class="card"><b>${dia(x.data)} · ${esc(x.combustivel)}</b><div>${n(x.litros,2)} L · ${reais(x.valor)} · ${reais(x.valor/x.litros)}/L</div><div class="sub">${n(x.km)} km${c[x.id]?' · '+n(c[x.id],1)+' km/l':''}</div><button class="link" data-apagar="abastecimentos" data-id="${x.id}">Apagar</button></div>`).join('')||'<p class="sub">Nada registrado ainda.</p>'}`;
+ },
+ manut(){
+  return `<form class="card" data-form="manut">${campo('servico','Serviço','text','placeholder="Troca de óleo" required')}${campo('data','Data','date',`value="${hoje()}" required`)}
+  ${campo('km','KM no painel','text',int+' required')}${campo('valor','Valor (R$)','text',dec)}
+  ${campo('proximo_km','Próxima com quantos KM (opcional)','text',int)}${campo('proxima_data','Próxima até a data (opcional)','date')}<button>Salvar manutenção</button></form>
+  <h2>Histórico</h2>${D.manut.map(x=>`<div class="card"><b>${esc(x.servico)}</b><div>${dia(x.data)} · ${n(x.km)} km${x.valor!=null?' · '+reais(x.valor):''}</div><button class="link" data-apagar="manutencoes" data-id="${x.id}">Apagar</button></div>`).join('')||'<p class="sub">Nada registrado ainda.</p>'}`;
+ }
+};
+
+function desenhar(){
+  const nav=$('#nav');
+  if(!cfg||!sessao){
+    nav.hidden=true;
+    $('#tela').innerHTML=`<form class="card" data-form="login">${campo('url','URL do projeto Supabase','url',`value="${esc(cfg?.url)}" required`)}${campo('key','Chave pública (publishable ou anon)','text',`value="${esc(cfg?.key)}" required autocapitalize="off" autocorrect="off"`)}${campo('email','E-mail','email','required')}${campo('senha','Senha','password','required')}<button>Entrar</button></form>`;
+    return;
+  }
+  nav.hidden=false;
+  nav.innerHTML=[['painel','Painel'],['abast','Abastecer'],['manut','Manutenção']].map(([k,r])=>`<button data-aba="${k}" class="${aba===k?'on':''}">${r}</button>`).join('');
+  $('#tela').innerHTML=telas[aba]();
+}
+function sair(){sessao=null;try{localStorage.removeItem('sessao')}catch(e){}desenhar()}
+async function tentar(f){
+  $('#msg').textContent='';
+  try{await f()}catch(e){$('#msg').textContent=e instanceof TypeError?'Sem conexão com o banco. Confira a internet e a URL.':e.message}
+}
+
+document.addEventListener('submit',ev=>{
+  ev.preventDefault();
+  const form=ev.target,tipo=form.dataset.form,v=Object.fromEntries(new FormData(form)),botao=form.querySelector('button');
+  botao.disabled=true;
+  tentar(async()=>{
+    if(tipo==='login'){
+      cfg={url:v.url.trim().replace(/\/+$/,''),key:v.key.trim()};gravar('cfg',cfg);
+      await auth('password',{email:v.email.trim(),password:v.senha});
+    }else if(tipo==='ajuste'){
+      await api('ajustes?on_conflict=user_id','POST',{km_base:num(v.km_base),km_acumulado_base:D.status?.km_acumulado??null},'resolution=merge-duplicates');
+    }else if(tipo==='abast'){
+      await api('abastecimentos','POST',{data:v.data,km:num(v.km),litros:num(v.litros),valor:num(v.valor),combustivel:v.combustivel,tanque_cheio:!!v.tanque_cheio});
+    }else{
+      await api('manutencoes','POST',{data:v.data,km:num(v.km),servico:v.servico.trim(),valor:num(v.valor),proximo_km:num(v.proximo_km),proxima_data:v.proxima_data||null});
+    }
+    await carregar();desenhar();
+  }).finally(()=>botao.disabled=false);
+});
+document.addEventListener('click',ev=>{
+  const b=ev.target.closest('button');if(!b)return;
+  if(b.dataset.aba){aba=b.dataset.aba;desenhar();scrollTo(0,0)}
+  else if(b.dataset.acao==='sair')sair();
+  else if(b.dataset.acao==='atualizar')tentar(async()=>{await carregar();desenhar()});
+  else if(b.dataset.apagar&&confirm('Apagar este registro?'))tentar(async()=>{await api(b.dataset.apagar+'?id=eq.'+Number(b.dataset.id),'DELETE');await carregar();desenhar()});
+});
+desenhar();
+if(cfg&&sessao)tentar(async()=>{await carregar();desenhar()});
+</script>
+</body>
+</html>
